@@ -1,23 +1,33 @@
 #!/usr/bin/env python3
 """
-Export every Keap contact's tags to an Excel file, keyed by email,
-so they can later be matched against and re-inserted into HubSpot.
+Export every Keap opportunity (deal) with the tags of its linked contact.
 
-Also writes out the full distinct list of tag names (a plain .txt,
-one per line, plus an "All Tags" sheet in the workbook) so it can be
-pasted straight into HubSpot when creating a multi-checkbox/dropdown
-property and pre-populating all of its options in one go.
+Like companies, opportunities don't carry tags themselves in Keap --
+only Contacts do. So each opportunity's "tags" here are just its
+linked contact's tags.
 
 Setup:
     pip install requests openpyxl python-dotenv
-    Create a .env file next to this script containing:
+    Uses the same .env as "keap tags.py":
         KEAP_API_KEY=the key you generated
 
 Usage:
-    python "keap tags.py" [--output keap_tags_export.xlsx] [--tags-txt keap_all_tags_for_hubspot.txt]
+    python keap_opportunity_tags.py [--output keap_opportunity_tags_export.xlsx]
 
 Auth: Keap REST API v1, key-based auth via the `X-Keap-API-Key` header.
 Docs: https://developer.infusionsoft.com/docs/rest/
+
+NOTE on unverified assumptions (same caveat style as "get subs.py" --
+matches the v1 docs but hasn't been re-confirmed against a live
+response as of this writing):
+    - GET /opportunities paginates with limit/offset, list key
+      "opportunities", same as /contacts.
+    - Each opportunity has a nested "contact" object with at least an
+      "id" (e.g. {"id": 123}), and a nested "stage" object with "id"
+      and "label"/"name". This script tries a couple of key names for
+      the stage label; if it prints "[unknown stage field]" for every
+      row, run with --debug once to print a raw record and fix
+      STAGE_NAME_KEYS below.
 """
 
 import os
@@ -31,12 +41,13 @@ from openpyxl import Workbook
 
 try:
     from dotenv import load_dotenv
-    load_dotenv()  # reads .env in the current directory (or a parent) into os.environ
+    load_dotenv()
 except ImportError:
     sys.exit("Missing dependency: run `pip install python-dotenv` (or `pip install -r requirements.txt`).")
 
 BASE_URL = "https://api.infusionsoft.com/crm/rest/v1"
-PAGE_SIZE = 200  # practical max page size Keap's /contacts endpoint accepts
+PAGE_SIZE = 200
+STAGE_NAME_KEYS = ("label", "name")  # tried in order against the "stage" object
 
 
 def get_api_key():
@@ -68,7 +79,7 @@ def keap_get(session, path, params=None, max_retries=5):
 
 
 def fetch_all_tags(session):
-    """Fetch every tag definition (id -> name) to label contacts' tag_ids."""
+    """Fetch every tag definition (id -> name)."""
     tags = {}
     offset = 0
     while True:
@@ -123,28 +134,26 @@ def write_tag_reference(tag_names, wb, txt_path):
     return unique_names
 
 
-def fetch_all_contacts_with_tags(session):
-    """
-    Fetch every contact along with its tag_ids in one pass, using
-    optional_properties=tag_ids so we don't need a separate API call
-    per contact just to get its tags.
-    """
-    contacts = []
+def fetch_all_contacts_indexed(session):
+    """Fetch every contact once; return {contact_id: {email, first, last, tag_ids}}."""
+    index = {}
     offset = 0
     while True:
-        params = {
-            "limit": PAGE_SIZE,
-            "offset": offset,
-            "optional_properties": "tag_ids",
-        }
+        params = {"limit": PAGE_SIZE, "offset": offset, "optional_properties": "tag_ids"}
         data = keap_get(session, "/contacts", params=params)
         batch = data.get("contacts", [])
-        contacts.extend(batch)
-        print(f"  Fetched {len(contacts)} contacts so far...")
+        for c in batch:
+            index[c["id"]] = {
+                "email": primary_email(c),
+                "first": c.get("given_name", "") or "",
+                "last": c.get("family_name", "") or "",
+                "tag_ids": c.get("tag_ids") or [],
+            }
+        print(f"  Indexed {len(index)} contacts so far...")
         if len(batch) < PAGE_SIZE:
             break
         offset += PAGE_SIZE
-    return contacts
+    return index
 
 
 def primary_email(contact):
@@ -155,65 +164,99 @@ def primary_email(contact):
     return emails[0]["email"] if emails else ""
 
 
+def fetch_all_opportunities(session):
+    opportunities = []
+    offset = 0
+    while True:
+        data = keap_get(session, "/opportunities", params={"limit": PAGE_SIZE, "offset": offset})
+        batch = data.get("opportunities", [])
+        opportunities.extend(batch)
+        print(f"  Fetched {len(opportunities)} opportunities so far...")
+        if len(batch) < PAGE_SIZE:
+            break
+        offset += PAGE_SIZE
+    return opportunities
+
+
+def stage_label(opp):
+    stage = opp.get("stage") or {}
+    for key in STAGE_NAME_KEYS:
+        if stage.get(key):
+            return stage[key]
+    return "[unknown stage field]" if stage else ""
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Export Keap contacts + tags to Excel.")
-    parser.add_argument("--output", default="keap_tags_export.xlsx")
+    parser = argparse.ArgumentParser(description="Export Keap opportunities + their contacts' tags to Excel.")
+    parser.add_argument("--output", default="keap_opportunity_tags_export.xlsx")
     parser.add_argument("--tags-txt", default="keap_all_tags_for_hubspot.txt",
                          help="Plain-text file listing every distinct tag name, one per line.")
+    parser.add_argument("--debug", action="store_true", help="Print one raw opportunity record and exit.")
     args = parser.parse_args()
 
     api_key = get_api_key()
     session = requests.Session()
     session.headers.update({"X-Keap-API-Key": api_key, "Accept": "application/json"})
 
+    if args.debug:
+        data = keap_get(session, "/opportunities", params={"limit": 1, "offset": 0})
+        import json
+        print(json.dumps(data.get("opportunities", [None])[0], indent=2))
+        return
+
     print("Fetching tag definitions...")
     tag_names = fetch_all_tags(session)
 
-    print("Fetching contacts (this can take a while for large lists)...")
-    contacts = fetch_all_contacts_with_tags(session)
-    print(f"Fetched {len(contacts)} contacts total.")
+    print("Indexing contacts (tags + basic info)...")
+    contacts = fetch_all_contacts_indexed(session)
+    print(f"Indexed {len(contacts)} contacts total.")
+
+    print("Fetching opportunities...")
+    opportunities = fetch_all_opportunities(session)
+    print(f"Fetched {len(opportunities)} opportunities total.")
 
     wb = Workbook()
 
-    # Sheet: one row per contact, tags semicolon-joined.
-    # Semicolon-separated is what HubSpot's import expects for a
-    # multi-checkbox / multi-select property, if that's the route you
-    # take when you reinsert these into HubSpot later.
     ws1 = wb.active
-    ws1.title = "Contacts"
-    ws1.append(["keap_contact_id", "email", "first_name", "last_name", "tags"])
+    ws1.title = "Opportunities"
+    ws1.append(["opportunity_id", "opportunity_title", "stage", "contact_id",
+                "email", "first_name", "last_name", "tags"])
 
     write_tag_reference(tag_names, wb, args.tags_txt)
 
-    # Sheet: one row per contact-tag pair, for pivoting/spot-checking.
-    ws2 = wb.create_sheet("Contact-Tag Pairs")
-    ws2.append(["keap_contact_id", "email", "tag_id", "tag_name"])
+    ws2 = wb.create_sheet("Opportunity-Tag Pairs")
+    ws2.append(["opportunity_id", "opportunity_title", "tag_id", "tag_name"])
 
     unmatched_tag_ids = set()
-    skipped_no_email = 0
+    no_contact = 0
 
-    for c in contacts:
-        cid = c.get("id")
-        email = primary_email(c)
-        if not email:
-            skipped_no_email += 1
-        first = c.get("given_name", "") or ""
-        last = c.get("family_name", "") or ""
-        tag_ids = c.get("tag_ids") or []
+    for opp in opportunities:
+        oid = opp.get("id")
+        title = opp.get("opportunity_title") or opp.get("title") or ""
+        contact_id = (opp.get("contact") or {}).get("id")
+        contact = contacts.get(contact_id, {})
+        if not contact_id:
+            no_contact += 1
+
         names = []
-        for tid in tag_ids:
+        for tid in contact.get("tag_ids", []):
             name = tag_names.get(tid)
             if name is None:
                 unmatched_tag_ids.add(tid)
                 name = f"[unknown tag {tid}]"
             names.append(name)
-            ws2.append([cid, email, tid, name])
-        ws1.append([cid, email, first, last, "; ".join(sorted(names))])
+            ws2.append([oid, title, tid, name])
+
+        ws1.append([
+            oid, title, stage_label(opp), contact_id,
+            contact.get("email", ""), contact.get("first", ""), contact.get("last", ""),
+            "; ".join(sorted(names)),
+        ])
 
     wb.save(args.output)
-    print(f"\nSaved {len(contacts)} contacts to {args.output}")
-    if skipped_no_email:
-        print(f"Note: {skipped_no_email} contact(s) had no email address (matching to HubSpot by email won't work for these).")
+    print(f"\nSaved {len(opportunities)} opportunities to {args.output}")
+    if no_contact:
+        print(f"Note: {no_contact} opportunity(ies) had no linked contact.")
     if unmatched_tag_ids:
         print(f"Warning: {len(unmatched_tag_ids)} tag id(s) had no matching name: {sorted(unmatched_tag_ids)}")
 
